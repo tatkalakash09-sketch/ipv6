@@ -13,9 +13,26 @@ rm -rf 3proxy
 git clone https://github.com/z3APA3A/3proxy.git
 cd 3proxy
 make -f Makefile.Linux
+
+echo "[*] Build finished, checking for binary..."
+ls -lh src/ || true
+ls -lh bin/ || true
+
+# Copy compiled binary (different versions place it differently)
 mkdir -p /usr/local/3proxy/bin
-cp src/3proxy /usr/local/3proxy/bin/
-cp ./cfg/* /usr/local/etc/3proxy/ || true
+if [ -f src/3proxy ]; then
+    echo "[*] Found binary in src/, copying..."
+    cp src/3proxy /usr/local/3proxy/bin/
+elif [ -f bin/3proxy ]; then
+    echo "[*] Found binary in bin/, copying..."
+    cp bin/3proxy /usr/local/3proxy/bin/
+else
+    echo "[!] 3proxy binary not found after build!"
+    exit 1
+fi
+
+# Copy configs if available
+cp -r ./cfg/* /usr/local/etc/3proxy/ || true
 
 # Create users file if missing
 echo "[*] Setting up users..."
