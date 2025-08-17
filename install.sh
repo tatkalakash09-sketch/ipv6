@@ -1,83 +1,93 @@
 #!/bin/bash
-# ===============================
-# IPv6 Proxy Installer with Auto-Rotation
-# Compatible: Ubuntu 20-24
-# ===============================
+# =========================================
+# IPv4/IPv6 HTTP + SOCKS5 Proxy Installer
+# Works on Ubuntu 20.04 - 24.04
+# =========================================
 
 set -e
 
-PROXY_COUNT=500
-BASE_HTTP_PORT=10000
-BASE_SOCKS_PORT=20000
-ROTATE_INTERVAL=10  # minutes
-THREEPROXY_DIR="/opt/3proxy"
-CONFIG_DIR="/usr/local/etc/3proxy"
-LOG_FILE="/var/log/3proxy.log"
-PROXY_LIST="$CONFIG_DIR/proxy_list.txt"
+echo "[*] Updating system..."
+apt update -y && apt upgrade -y
 
-# Detect network interface
-ETH_INTERFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1)
-IPv4_ADDR=$(ip -4 addr show $ETH_INTERFACE | grep inet | awk '{print $2}' | cut -d/ -f1)
-IPv6_LIST=($(ip -6 addr show $ETH_INTERFACE | grep inet6 | awk '{print $2}' | cut -d/ -f1 | grep -v ^::1))
+echo "[*] Installing dependencies..."
+apt install -y build-essential wget curl git unzip make gcc net-tools
 
-if [ ${#IPv6_LIST[@]} -eq 0 ]; then
-    echo "[!] No IPv6 addresses detected on $ETH_INTERFACE"
-    exit 1
-fi
-
-apt update
-apt install -y git build-essential psmisc net-tools curl cron
-
+# ===============================
 # Install 3proxy
-mkdir -p $THREEPROXY_DIR
-git clone https://github.com/z3APA3A/3proxy.git $THREEPROXY_DIR
-cd $THREEPROXY_DIR
+# ===============================
+echo "[*] Installing 3proxy..."
+cd /usr/local/src
+rm -rf 3proxy
+git clone https://github.com/z3APA3A/3proxy.git
+cd 3proxy
 make -f Makefile.Linux
-mkdir -p $CONFIG_DIR
 
-# Function to generate proxies
-generate_proxies() {
-    > $CONFIG_DIR/3proxy.cfg
-    cat <<EOL > $CONFIG_DIR/3proxy.cfg
+mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
+cp src/3proxy /usr/local/etc/3proxy/bin/
+
+# ===============================
+# Generate Users
+# ===============================
+USERS_FILE="/usr/local/etc/3proxy/users.lst"
+echo "[*] Generating users..."
+rm -f $USERS_FILE
+
+for i in $(seq 1 100); do
+    USER="user$i"
+    PASS=$(openssl rand -hex 4)
+    echo "$USER:$PASS" >> $USERS_FILE
+done
+
+# ===============================
+# Generate 3proxy Config
+# ===============================
+CONFIG_FILE="/usr/local/etc/3proxy/3proxy.cfg"
+echo "[*] Generating 3proxy config..."
+rm -f $CONFIG_FILE
+
+cat <<EOL >> $CONFIG_FILE
+daemon
+maxconn 200
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
-log $LOG_FILE D
+setgid 65535
+setuid 65535
+flush
+auth strong
+users $(awk -F: '{print $1 " CL " $2}' $USERS_FILE | paste -sd ' ')
 EOL
-    > $PROXY_LIST
 
-    for ((i=0;i<$PROXY_COUNT;i++)); do
-        RAND_IP=${IPv6_LIST[$RANDOM % ${#IPv6_LIST[@]}]}
-        USER=$(head /dev/urandom | tr -dc a-z0-9 | head -c6)
-        PASS=$(head /dev/urandom | tr -dc a-z0-9 | head -c8)
-        echo "users $USER:CL:$PASS" >> $CONFIG_DIR/3proxy.cfg
+COUNTER=0
+while read -r USER_LINE; do
+    USER=$(echo "$USER_LINE" | cut -d: -f1)
+    PASS=$(echo "$USER_LINE" | cut -d: -f2)
+    HTTP_PORT=$((8081 + COUNTER))
+    SOCKS_PORT=$((1081 + COUNTER))
 
-        HTTP_PORT=$((BASE_HTTP_PORT+i))
-        SOCKS_PORT=$((BASE_SOCKS_PORT+i))
+    cat <<EOL >> $CONFIG_FILE
+allow $USER
+proxy -n -a -p$HTTP_PORT -i0.0.0.0 -e::0
+socks -p$SOCKS_PORT -i0.0.0.0 -e::0
+flush
+EOL
 
-        # HTTP proxy
-        echo "proxy -6 -n -a -i$IPv4_ADDR -e$RAND_IP -p$HTTP_PORT" >> $CONFIG_DIR/3proxy.cfg
-        echo "$RAND_IP:$HTTP_PORT:$USER:$PASS" >> $PROXY_LIST
+    COUNTER=$((COUNTER + 1))
+done < $USERS_FILE
 
-        # SOCKS5 proxy
-        echo "socks -6 -n -a -i$IPv4_ADDR -e$RAND_IP -p$SOCKS_PORT" >> $CONFIG_DIR/3proxy.cfg
-        echo "$RAND_IP:$SOCKS_PORT:$USER:$PASS" >> $PROXY_LIST
-    done
-}
-
-# Initial generation
-generate_proxies
-
-# Systemd service
-cat <<EOL > /etc/systemd/system/3proxy.service
+# ===============================
+# Systemd Service
+# ===============================
+SERVICE_FILE="/etc/systemd/system/3proxy.service"
+echo "[*] Creating systemd service..."
+cat <<EOL > $SERVICE_FILE
 [Unit]
 Description=3proxy Proxy Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$THREEPROXY_DIR/src/3proxy $CONFIG_DIR/3proxy.cfg
-Restart=on-failure
-LimitNOFILE=100000
+ExecStart=/usr/local/etc/3proxy/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
+Restart=always
 
 [Install]
 WantedBy=multi-user.target
@@ -85,55 +95,61 @@ EOL
 
 systemctl daemon-reload
 systemctl enable 3proxy
-systemctl start 3proxy
+systemctl restart 3proxy
 
-# Rotation script
-ROTATE_SCRIPT="$CONFIG_DIR/rotate_proxies.sh"
-cat <<'EOF' > $ROTATE_SCRIPT
-#!/bin/bash
-# Rotate proxy IPs and users without downtime
-PROXY_COUNT=500
-BASE_HTTP_PORT=10000
-BASE_SOCKS_PORT=20000
-CONFIG_DIR="/usr/local/etc/3proxy"
-THREEPROXY_DIR="/opt/3proxy"
-ETH_INTERFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1)
-IPv4_ADDR=$(ip -4 addr show $ETH_INTERFACE | grep inet | awk '{print $2}' | cut -d/ -f1)
-IPv6_LIST=($(ip -6 addr show $ETH_INTERFACE | grep inet6 | awk '{print $2}' | cut -d/ -f1 | grep -v ^::1))
-PROXY_LIST="$CONFIG_DIR/proxy_list.txt"
-LOG_FILE="/var/log/3proxy.log"
+# ===============================
+# Export Proxy List
+# ===============================
+PROXY_TXT="/root/proxy_list.txt"
+PROXY_CSV="/root/proxy_list.csv"
+PROXY_JSON="/root/proxy_list.json"
 
-> $CONFIG_DIR/3proxy.cfg
-cat <<EOL > $CONFIG_DIR/3proxy.cfg
-nscache 65536
-timeouts 1 5 30 60 180 1800 15 60
-log $LOG_FILE D
-EOL
-> $PROXY_LIST
+echo "[*] Exporting proxy list..."
+> "$PROXY_TXT"
+echo "protocol,ip,port,username,password" > "$PROXY_CSV"
+echo "[" > "$PROXY_JSON"
 
-for ((i=0;i<$PROXY_COUNT;i++)); do
-    RAND_IP=${IPv6_LIST[$RANDOM % ${#IPv6_LIST[@]}]}
-    USER=$(head /dev/urandom | tr -dc a-z0-9 | head -c6)
-    PASS=$(head /dev/urandom | tr -dc a-z0-9 | head -c8)
-    echo "users $USER:CL:$PASS" >> $CONFIG_DIR/3proxy.cfg
+SERVER_IPv4=$(hostname -I | awk '{print $1}')
+SERVER_IPv6=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n 1)
 
-    HTTP_PORT=$((BASE_HTTP_PORT+i))
-    SOCKS_PORT=$((BASE_SOCKS_PORT+i))
+COUNTER=0
+while read -r USER_LINE; do
+    USER=$(echo "$USER_LINE" | cut -d: -f1)
+    PASS=$(echo "$USER_LINE" | cut -d: -f2)
+    HTTP_PORT=$((8081 + COUNTER))
+    SOCKS_PORT=$((1081 + COUNTER))
 
-    echo "proxy -6 -n -a -i$IPv4_ADDR -e$RAND_IP -p$HTTP_PORT" >> $CONFIG_DIR/3proxy.cfg
-    echo "$RAND_IP:$HTTP_PORT:$USER:$PASS" >> $PROXY_LIST
+    # IPv4
+    echo "http://$SERVER_IPv4:$HTTP_PORT:$USER:$PASS" >> "$PROXY_TXT"
+    echo "socks5://$SERVER_IPv4:$SOCKS_PORT:$USER:$PASS" >> "$PROXY_TXT"
 
-    echo "socks -6 -n -a -i$IPv4_ADDR -e$RAND_IP -p$SOCKS_PORT" >> $CONFIG_DIR/3proxy.cfg
-    echo "$RAND_IP:$SOCKS_PORT:$USER:$PASS" >> $PROXY_LIST
-done
+    echo "http,$SERVER_IPv4,$HTTP_PORT,$USER,$PASS" >> "$PROXY_CSV"
+    echo "socks5,$SERVER_IPv4,$SOCKS_PORT,$USER,$PASS" >> "$PROXY_CSV"
 
-kill -HUP $(pidof 3proxy)
-EOF
+    echo "  {\"protocol\":\"http\",\"ip\":\"$SERVER_IPv4\",\"port\":\"$HTTP_PORT\",\"user\":\"$USER\",\"pass\":\"$PASS\"}," >> "$PROXY_JSON"
+    echo "  {\"protocol\":\"socks5\",\"ip\":\"$SERVER_IPv4\",\"port\":\"$SOCKS_PORT\",\"user\":\"$USER\",\"pass\":\"$PASS\"}," >> "$PROXY_JSON"
 
-chmod +x $ROTATE_SCRIPT
+    # IPv6
+    if [ -n "$SERVER_IPv6" ]; then
+        echo "http://[$SERVER_IPv6]:$HTTP_PORT:$USER:$PASS" >> "$PROXY_TXT"
+        echo "socks5://[$SERVER_IPv6]:$SOCKS_PORT:$USER:$PASS" >> "$PROXY_TXT"
 
-# Cron setup
-(crontab -l 2>/dev/null; echo "*/$ROTATE_INTERVAL * * * * $ROTATE_SCRIPT") | crontab -
+        echo "http,[$SERVER_IPv6],$HTTP_PORT,$USER,$PASS" >> "$PROXY_CSV"
+        echo "socks5,[$SERVER_IPv6],$SOCKS_PORT,$USER,$PASS" >> "$PROXY_CSV"
 
-echo "[*] Setup complete! Proxies will rotate every $ROTATE_INTERVAL minutes."
-echo "[*] Proxy list: $PROXY_LIST"
+        echo "  {\"protocol\":\"http\",\"ip\":\"$SERVER_IPv6\",\"port\":\"$HTTP_PORT\",\"user\":\"$USER\",\"pass\":\"$PASS\"}," >> "$PROXY_JSON"
+        echo "  {\"protocol\":\"socks5\",\"ip\":\"$SERVER_IPv6\",\"port\":\"$SOCKS_PORT\",\"user\":\"$USER\",\"pass\":\"$PASS\"}," >> "$PROXY_JSON"
+    fi
+
+    COUNTER=$((COUNTER + 1))
+done < $USERS_FILE
+
+# Clean JSON
+sed -i '$ s/},/}/' "$PROXY_JSON"
+echo "]" >> "$PROXY_JSON"
+
+echo "[*] Installation complete!"
+echo "Proxies saved to:"
+echo "  $PROXY_TXT"
+echo "  $PROXY_CSV"
+echo "  $PROXY_JSON"
